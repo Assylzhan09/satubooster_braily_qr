@@ -1,113 +1,148 @@
-global.crypto = require('crypto'); // добавляем глобальный модуль crypto
+global.crypto = require('crypto');
 
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
-const fetch = require('node-fetch')
-const express = require('express')
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const fetch = require('node-fetch');
+const express = require('express');
+const fs = require('fs');
 
-const app = express()
-app.use(express.json())
+const app = express();
+app.use(express.json());
 
-let sock // сокет WhatsApp
-let latestQR = null // последний QR-код
+let sock;
+let latestQR = null;
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth')
-  sock = makeWASocket({ auth: state })
+  const { state, saveCreds } = await useMultiFileAuthState('auth');
+  sock = makeWASocket({ auth: state });
 
-  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = update
+    const { connection, qr } = update;
     if (qr) {
-      latestQR = qr
-      console.log('📱 Новый QR-код (отсканируй через WhatsApp):')
-      console.log(qr)
+      latestQR = qr;
+      console.log('📱 Новый QR-код:');
+      console.log(qr);
     }
 
     if (connection === 'open') {
-      console.log('✅ Успешно подключено к WhatsApp!')
+      console.log('✅ Подключено к WhatsApp');
     }
 
     if (connection === 'close') {
-      console.log('❌ Соединение закрыто. Перезапуск...')
-      startBot()
+      console.log('❌ Соединение закрыто. Перезапуск...');
+      startBot();
     }
-  })
+  });
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message) return
+    const msg = messages[0];
+    if (!msg.message || msg.key.fromMe) return;
 
-    // 🛡️ Пропускаем исходящие сообщения от самого бота
-    if (msg.key.fromMe) return
+    const from = msg.key.remoteJid;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || ''
-    const from = msg.key.remoteJid
+    let payload = {
+      entry: [{
+        changes: [{
+          value: {
+            messages: [{
+              from,
+              text: { body: text }
+            }]
+          }
+        }]
+      }]
+    };
 
-    console.log(`📩 ${from}: ${text}`)
+    // 🎙 Обработка голосового
+    const { downloadMediaMessage } = require('@whiskeysockets/baileys'); // добавь в начало файла
 
-    // Отправляем в webhook
+    if (msg.message.audioMessage) {
+      try {
+        const buffer = await downloadMediaMessage(
+          msg,
+          "buffer",
+          {},
+          { logger: console, reuploadRequest: sock.updateMediaMessage }
+        );
+
+        // Сохраняем во временный файл
+        const fs = require('fs');
+        const tmpFile = `/tmp/audio-${Date.now()}.ogg`;
+        fs.writeFileSync(tmpFile, buffer);
+
+        const audioData = fs.readFileSync(tmpFile).toString('base64');
+
+        payload.entry[0].changes[0].value.messages[0].audio = {
+          data: audioData,
+          mime_type: msg.message.audioMessage.mimetype || 'audio/ogg'
+        };
+      } catch (err) {
+        console.error('Ошибка при загрузке аудио:', err);
+      }
+    }
+
+    // Лог
+    fs.appendFileSync("node_log.txt", JSON.stringify(payload) + "\n");
+
+    // Отправка в webhook
     await fetch('https://satucrm.satubooster.kz/antitarakan-partner/webhook.php', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        entry: [{
-          changes: [{
-            value: {
-              messages: [{
-                from: from,
-                text: { body: text }
-              }]
-            }
-          }]
-        }]
-      })
-    })
-  })
+      body: JSON.stringify(payload)
+    });
+  });
 }
 
-startBot()
+startBot();
 
-// 📡 API для получения текущего QR-кода
+// 📡 QR-код API
 app.get('/qr', (req, res) => {
   if (latestQR) {
-    res.json({ qr: latestQR })
+    res.json({ qr: latestQR });
   } else {
-    res.status(404).json({ error: 'QR-код недоступен' })
+    res.status(404).json({ error: 'QR-код недоступен' });
   }
-})
+});
 
-// 📤 API для отправки сообщений
+// 📤 Отправка сообщений
 app.get('/send.php', async (req, res) => {
   const { to, text, image } = req.query;
 
-  if (!to) {
-    return res.status(400).send('❌ Не указан параметр "to"');
-  }
+  console.log('📨 send.php запрос:', { to, text, image });
+
+  if (!to) return res.status(400).send('❌ Не указан параметр "to"');
+  if (!sock) return res.status(500).send('❌ sock не инициализирован');
 
   try {
-    // Если есть фото — отправляем фото
     if (image) {
       await sock.sendMessage(to, {
         image: { url: image },
         caption: text || 'Анти-Таракан — 10 000 ₸. Жеткізу тегін!'
       });
+      console.log('✅ Фото отправлено');
       return res.send('✅ Фото отправлено');
     }
 
-    // Если только текст
     if (text) {
       await sock.sendMessage(to, { text });
+      console.log('✅ Текст отправлен');
       return res.send('✅ Текст отправлен');
     }
 
-    res.status(400).send('❌ Ничего не отправлено (нет text и image)');
+    res.status(400).send('❌ Нет text или image');
   } catch (err) {
-    console.error('Ошибка при отправке:', err);
+    console.error('❌ Ошибка отправки:', err);
     res.status(500).send('❌ Ошибка при отправке');
   }
 });
 
-app.listen(3000, () => {
-  console.log('🌐 Web API слушает на http://localhost:3000')
+// 🔧 Проверка API
+app.get('/test', (req, res) => {
+  res.send('✅ Node.js работает');
+});
+
+app.listen(3000, '0.0.0.0', () => {
+  console.log('🌐 Web API слушает на http://0.0.0.0:3000')
 })
