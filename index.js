@@ -1,16 +1,20 @@
 global.crypto = require('crypto');
 
-const { 
-  default: makeWASocket, 
-  useMultiFileAuthState, 
-  DisconnectReason, 
-  downloadMediaMessage 
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage
 } = require('@whiskeysockets/baileys');
-const fetch = require('node-fetch');
+const fetch = (...args) => import('node-fetch').then(mod => mod.default(...args));
 const express = require('express');
 const fs = require('fs');
 
 const app = express();
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  next();
+});
 app.use(express.json());
 
 let sock;
@@ -22,18 +26,9 @@ async function startBot() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, qr } = update;
-    if (qr) {
-      latestQR = qr;
-      console.log('📱 Новый QR-код для входа:');
-      console.log(qr);
-    }
-
-    if (connection === 'open') {
-      console.log('✅ Подключено к WhatsApp!');
-    }
-
+  sock.ev.on('connection.update', ({ connection, qr }) => {
+    if (qr) latestQR = qr;
+    if (connection === 'open') console.log('✅ Подключено к WhatsApp!');
     if (connection === 'close') {
       console.log('❌ Соединение закрыто. Перезапуск...');
       setTimeout(startBot, 2000);
@@ -43,61 +38,37 @@ async function startBot() {
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     if (!msg.message || msg.key.fromMe) return;
+
     const from = msg.key.remoteJid;
 
-    // === ГОЛОСОВОЕ (АУДИО) ===
+    // --- Аудио
     if (msg.message.audioMessage) {
       try {
-        const buffer = await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          { logger: console, reuploadRequest: sock.updateMediaMessage }
-        );
+        const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+          logger: console,
+          reuploadRequest: sock.updateMediaMessage
+        });
         const audioData = buffer.toString('base64');
         const mimeType = msg.message.audioMessage.mimetype || 'audio/ogg';
 
-        const payload = {
-          entry: [{
-            changes: [{
-              value: {
-                messages: [{
-                  from,
-                  audio: { data: audioData, mime_type: mimeType }
-                }]
-              }
-            }]
-          }]
-        };
-
-        fs.appendFileSync("node_log.txt", JSON.stringify(payload) + "\n");
-        await fetch('https://satucrm.satubooster.kz/antitarakan-partner/webhook.php', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        return;
+        await sendToWebhook({ from, audio: { data: audioData, mime_type: mimeType } });
       } catch (err) {
         console.error('Ошибка при загрузке аудио:', err);
-        return;
       }
+      return;
     }
 
-    // === ИЗОБРАЖЕНИЕ или ДОКУМЕНТ ===
+    // --- Фото или файл
     if (msg.message.imageMessage || msg.message.documentMessage) {
       try {
-        const buffer = await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          { logger: console, reuploadRequest: sock.updateMediaMessage }
-        );
+        const buffer = await downloadMediaMessage(msg, "buffer", {}, {
+          logger: console,
+          reuploadRequest: sock.updateMediaMessage
+        });
         const base64File = buffer.toString('base64');
-        let payloadMsg = { from };
+        const payloadMsg = { from };
 
-        if (msg.message.imageMessage) {
-          payloadMsg.image = { data: base64File };
-        }
+        if (msg.message.imageMessage) payloadMsg.image = { data: base64File };
         if (msg.message.documentMessage) {
           payloadMsg.document = {
             data: base64File,
@@ -105,87 +76,59 @@ async function startBot() {
           };
         }
 
-        const payload = {
-          entry: [{
-            changes: [{
-              value: {
-                messages: [payloadMsg]
-              }
-            }]
-          }]
-        };
-
-        fs.appendFileSync("node_log.txt", JSON.stringify(payload) + "\n");
-        await fetch('https://satucrm.satubooster.kz/antitarakan-partner/webhook.php', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
-        return;
+        await sendToWebhook(payloadMsg);
       } catch (err) {
         console.error('Ошибка при загрузке файла:', err);
-        return;
       }
+      return;
     }
 
-    // === ТЕКСТ ===
+    // --- Текст
     const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
     if (text) {
-      const payload = {
-        entry: [{
-          changes: [{
-            value: {
-              messages: [{
-                from,
-                text: { body: text }
-              }]
-            }
-          }]
-        }]
-      };
-
-      fs.appendFileSync("node_log.txt", JSON.stringify(payload) + "\n");
-      await fetch('https://satucrm.satubooster.kz/antitarakan-partner/webhook.php', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+      await sendToWebhook({ from, text: { body: text } });
     }
+  });
+}
+
+async function sendToWebhook(message) {
+  const payload = {
+    entry: [{ changes: [{ value: { messages: [message] } }] }]
+  };
+  fs.appendFileSync("node_log.txt", JSON.stringify(payload) + "\n");
+
+  await fetch('https://satucrm.satubooster.kz/vivood_tau_partner/webhook.php', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
 }
 
 startBot();
 
-// === QR-код API ===
+// === API ===
 app.get('/qr', (req, res) => {
-  if (latestQR) {
-    res.json({ qr: latestQR });
-  } else {
-    res.status(404).json({ error: 'QR-код недоступен' });
-  }
+  if (latestQR) return res.json({ qr: latestQR });
+  res.status(404).json({ error: 'QR-код недоступен' });
 });
 
-// === Отправка сообщений API ===
-app.get('/send.php', async (req, res) => {
+app.get('/send', async (req, res) => {
   const { to, text, image } = req.query;
-
-  if (!to) return res.status(400).send('❌ Не указан параметр "to"');
+  if (!to) return res.status(400).send('❌ Не указан "to"');
   if (!sock) return res.status(500).send('❌ sock не инициализирован');
 
   try {
     if (image) {
       await sock.sendMessage(to, {
         image: { url: image },
-        caption: text || 'Анти-Таракан — 10 000 ₸. Жеткізу тегін!'
+        caption: text || ''
       });
       return res.send('✅ Фото отправлено');
     }
-
     if (text) {
       await sock.sendMessage(to, { text });
       return res.send('✅ Текст отправлен');
     }
-
     res.status(400).send('❌ Нет text или image');
   } catch (err) {
     console.error('❌ Ошибка отправки:', err);
@@ -193,11 +136,27 @@ app.get('/send.php', async (req, res) => {
   }
 });
 
-// === Проверка API ===
 app.get('/test', (req, res) => {
   res.send('✅ Node.js работает');
 });
 
-app.listen(3000, '0.0.0.0', () => {
-  console.log('🌐 Web API слушает на http://0.0.0.0:3000');
+// === API logout для отключения Baileys ===
+app.post('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout();
+      res.send('✅ Baileys отключён');
+      // Можешь добавить обнуление переменных если нужно
+      sock = null;
+      latestQR = null;
+    } else {
+      res.status(400).send('❌ Не подключено');
+    }
+  } catch (e) {
+    res.status(500).send('Ошибка: ' + e);
+  }
+});
+
+app.listen(3003, '0.0.0.0', () => {
+  console.log('🌐 Web API слушает на http://0.0.0.0:3003');
 });
